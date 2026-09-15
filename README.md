@@ -5,11 +5,12 @@ diagnostics: interfaces, IP configuration, ARP table, routing table, active
 TCP/UDP connections (with owning process), local port availability, LAN
 subnet sweeps, interface traffic counters, traceroute, and Wi-Fi status.
 
-**Zero dependencies.** Like `mcp-internet-tools`, this server does not use
-the `mcp` Python SDK (`pip install mcp`) or any other third-party package —
-not even for the MCP protocol itself. Everything is implemented with the
-Python standard library only (`ctypes`, `socket`, `struct`, `subprocess`,
-`ipaddress`, `json`, `sys`). Nothing to install beyond Python itself.
+**Zero dependencies.** Like `mcp-internet-tools` and `mcp-weather-forecast`,
+this server does not use the `mcp` Python SDK (`pip install mcp`) or any
+other third-party package — not even for the MCP protocol itself. Everything
+is implemented with the Python standard library only (`ctypes`, `socket`,
+`struct`, `subprocess`, `ipaddress`, `http.server`, `argparse`, `json`,
+`sys`). Nothing to install beyond Python itself, for either transport below.
 
 On **Windows**, interfaces/ARP/routes/connections/interface-stats are read
 directly from the IP Helper API (`iphlpapi.dll`) via `ctypes`, instead of
@@ -20,14 +21,50 @@ those, but parsing is limited to locale-independent tokens (numbers, IPs,
 `ms`, `*`) rather than matching against translated labels.
 
 This server only talks to the **local network/system** (interfaces,
-neighbours on the LAN, local sockets). Remote HTTP/DNS/WHOIS/TLS
-diagnostics against the internet are deliberately out of scope — that's the
-separate `mcp-internet-tools` server.
+neighbours on the LAN, local sockets) **of the machine it runs on**. Remote
+HTTP/DNS/WHOIS/TLS diagnostics against the internet are deliberately out of
+scope — that's the separate `mcp-internet-tools` server. That "machine it
+runs on" scope matters for Docker — see the **Docker** section below before
+containerizing this one.
 
 **Platform support:** Windows is the primary, fully-implemented target
 (tested against the real IP Helper API). Linux has best-effort fallbacks via
 `/proc` and `iproute2` (no owning-process resolution for connections; no
-DHCP details). macOS is not specifically supported.
+DHCP details) — written to the same contract as the Windows path and
+exercised via the Docker image below, but not yet verified against a bare
+Linux host by hand. macOS is not specifically supported.
+
+## Transports
+
+One script, one set of tools, two ways to run it — pick per client with
+`--transport`:
+
+```bash
+python mcp-network-tools.py --transport stdio
+python mcp-network-tools.py --transport streamable-http --host 0.0.0.0 --port 8000
+```
+
+- **`stdio`** (default — existing configs keep working unchanged) — the
+  server talks JSON-RPC over stdin/stdout. Use this for clients that spawn
+  the process directly: **Goose**, **Claude Desktop**, `mcp-tool-manager`.
+- **`streamable-http`** — the server listens on `--host`/`--port` and
+  serves the MCP endpoint at `POST http://<host>:<port>/mcp`. Use this for
+  clients that talk to a running server over HTTP instead of spawning a
+  process: **n8n**, or when running the server in **Docker**. `--host
+  0.0.0.0` is what you generally want in a container so it accepts
+  connections from outside it. This server only implements the
+  request/response half of the Streamable HTTP transport (no
+  server-initiated SSE stream) since none of its tools need to push
+  unsolicited messages — `GET`/`DELETE` on the endpoint return `405`/`200`
+  respectively rather than opening a stream or tracking a session.
+
+Run `python mcp-network-tools.py --help` for the full option list:
+
+```
+--transport {stdio,streamable-http}
+--host HOST
+--port PORT
+```
 
 ## Quick start
 
@@ -66,16 +103,76 @@ extensions:
     enabled: true
 ```
 
-**Any other MCP client**: configure it to run
+**Any other stdio MCP client**: configure it to run
 `python K:\mcp-tools\mcp-network-tools\mcp-network-tools.py` as a
 stdio-based MCP server — no ports, no config files.
+
+**n8n / Docker (streamable-http)** — run the server with the HTTP transport
+instead, then point the MCP client node at the endpoint:
+
+```bash
+python mcp-network-tools.py --transport streamable-http --host 0.0.0.0 --port 8000
+```
+
+MCP endpoint: `http://<host>:8000/mcp`. See the **Docker** section below —
+containerizing this specific server needs one extra consideration
+(`network_mode: host`) that most other tools in this repo don't.
+
+If you're using `mcp-tool-manager` from this same `mcp-tools` folder, its
+`toolboxes.json` already has a `network` entry pointing at this script over
+stdio (the default transport, so no `--transport` flag needed there).
+
+## Docker
+
+```bash
+docker compose up -d
+```
+
+uses the included [`docker-compose.yml`](docker-compose.yml): a bare
+`python:3.12-slim` image that `git clone`s/`pull`s this repo and runs
+`mcp-network-tools.py --transport streamable-http` — same zero-`pip`-install
+pattern as the other tools in this repo (see `mcp-weather-forecast`'s
+compose file), plus `iproute2`/`iputils-ping`/`traceroute` so `list_interfaces`,
+`subnet_scan` and `traceroute` have something to shell out to on the
+Linux fallback path.
+
+**The one thing that's different here versus every other tool in this repo:
+`network_mode: host` is required, not optional.** This server's entire
+purpose is reporting on the network of the machine it runs on. A container's
+default (bridge) network is its *own* isolated virtual interface, ARP table
+and routing table — completely disconnected from your real LAN. Run this
+server in a normal container and every tool still returns a "successful"
+result, just a meaningless one: `list_interfaces` shows the container's
+internal `eth0`, `arp_table` is empty, `subnet_scan` of your actual home
+network finds nothing. `network_mode: host` makes the container share the
+host's real network namespace instead, so it sees what you actually asked
+for. Docker grants `NET_RAW` by default, so ICMP `ping`/`traceroute` work
+without extra `cap_add`.
+
+**This only works on a Linux Docker host.** Docker Desktop on Windows/Mac
+runs Linux containers inside a lightweight VM (WSL2 on Windows); even with
+host networking enabled there, the container sees that VM's network, not
+your physical machine's real adapters/ARP/routing table — and being a Linux
+container, it would hit this server's `/proc`-based POSIX fallback code
+paths regardless, never the Windows-specific `iphlpapi.dll` path, so you'd
+lose the DHCP details, per-connection process names, and other Windows-only
+richness documented below even if the data were otherwise meaningful.
+
+**On Windows, skip Docker and run the script natively instead** — it's a
+single dependency-free `.py` file, so there's no packaging benefit to
+containerizing it there anyway:
+
+```powershell
+python mcp-network-tools.py --transport streamable-http --host 0.0.0.0 --port 8000
+```
 
 ## Requirements
 
 - Python 3.10+ (uses `from __future__ import annotations` and `X | None`
   style type hints)
 - Windows for full functionality. On Linux, `iproute2` (`ip`) is used for
-  interfaces/gateway; `/proc/net/*` for ARP/routes/connections/stats.
+  interfaces/gateway; `/proc/net/*` for ARP/routes/connections/stats;
+  `ping`/`traceroute` binaries for `subnet_scan`/`traceroute`.
 
 ## Available tools
 

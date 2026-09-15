@@ -1,0 +1,43 @@
+services:
+  mcp-network-tools:
+    image: python:3.12-slim
+    container_name: mcp-network-tools
+    restart: unless-stopped
+
+    # REQUIRED, not optional: this tool reports on the network of the
+    # machine it runs in. Without host networking it would only ever see
+    # this container's own isolated virtual interface/ARP/route table, not
+    # your real LAN - every tool would still "work" but return meaningless
+    # data. Host networking only works on a LINUX Docker host; see the
+    # "Docker" section of README.md before deploying this on Windows (Docker
+    # Desktop's Linux containers run inside a WSL2 VM whose network is not
+    # the real Windows host either way - run the script natively there
+    # instead of in Docker).
+    network_mode: host
+
+    environment:
+      - TZ=Europe/Amsterdam
+
+    volumes:
+      - mcp-network-tools_data:/app
+
+    command: >
+      sh -c "
+        apt-get update &&
+        apt-get install -y --no-install-recommends git ca-certificates iproute2 iputils-ping traceroute &&
+        rm -rf /var/lib/apt/lists/* &&
+
+        if [ ! -d /app/.git ]; then
+          git clone https://github.com/DomoticX/mcp-network-tools.git /app;
+        else
+          cd /app &&
+          git pull;
+        fi &&
+
+        cd /app &&
+
+        exec python3 mcp-network-tools.py --transport streamable-http --host 0.0.0.0 --port 8000
+      "
+
+volumes:
+  mcp-network-tools_data:

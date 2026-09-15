@@ -8,8 +8,9 @@ UDP connections (with owning process), local port availability, LAN subnet
 sweeps, interface traffic counters, traceroute, and Wi-Fi status.
 
 100% Python standard library - no "pip install mcp", no third-party
-packages. The MCP JSON-RPC/stdio protocol is implemented natively (see the
-"MCP protocol (stdio)" section below), same as mcp-internet-tools.py.
+packages. The MCP JSON-RPC protocol is implemented natively (same minimal
+approach as mcp-internet-tools.py / mcp-weather-forecast.py), over either
+stdio or streamable-http (also stdlib-only, via http.server).
 
 On Windows, interfaces/ARP/routes/connections/interface-stats are read
 directly from the IP Helper API (iphlpapi.dll) via ctypes, instead of
@@ -17,19 +18,30 @@ shelling out to ipconfig/arp/route/netstat and parsing their (locale-
 dependent) text output. traceroute and wifi_info still have to shell out
 (tracert/netsh) - there's no clean structured API for those - but parsing
 is limited to locale-independent tokens (numbers, IPs, "ms", "*") rather
-than matching against translated labels.
+than matching against translated labels. On Linux, the same tools fall
+back to /proc and iproute2 (ip).
 
 This server only talks to the **local network/system** (interfaces,
-neighbours on the LAN, local sockets). Remote HTTP/DNS/WHOIS/TLS diagnostics
-against the internet are deliberately out of scope - that's the separate
-mcp-internet-tools server.
+neighbours on the LAN, local sockets) **of the machine it runs on**.
+Remote HTTP/DNS/WHOIS/TLS diagnostics against the internet are deliberately
+out of scope - that's the separate mcp-internet-tools server. Note that
+this "machine it runs on" scope has a real consequence for containerized
+deployment - see the "Docker" section of README.md before running this
+under Docker without --network host.
 
-Run:
+Run (stdio, default - e.g. Goose, Claude Desktop):
     python mcp-network-tools.py
+    python mcp-network-tools.py --transport stdio
+
+Run (streamable-http - e.g. n8n, Docker):
+    python mcp-network-tools.py --transport streamable-http --host 0.0.0.0 --port 8000
+
+    Serves the MCP endpoint at POST http://<host>:<port>/mcp
 """
 
 from __future__ import annotations
 
+import argparse
 import ipaddress
 import json
 import platform
@@ -39,7 +51,9 @@ import struct
 import subprocess
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1019,21 +1033,8 @@ register_tool(
 
 
 # ---------------------------------------------------------------------------
-# MCP protocol (stdio) - minimal native JSON-RPC 2.0 implementation
+# MCP protocol - minimal native JSON-RPC 2.0 implementation, transport-agnostic
 # ---------------------------------------------------------------------------
-
-def write_message(obj: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
-
-
-def send_result(msg_id: Any, result: dict[str, Any]) -> None:
-    write_message({"jsonrpc": "2.0", "id": msg_id, "result": result})
-
-
-def send_error(msg_id: Any, code: int, message: str) -> None:
-    write_message({"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}})
-
 
 def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
     requested = params.get("protocolVersion")
@@ -1072,7 +1073,12 @@ def handle_tools_call(params: dict[str, Any]) -> dict[str, Any]:
         return {"isError": True, "content": [{"type": "text", "text": f"{type(exc).__name__}: {exc}"}]}
 
 
-def dispatch(request: dict[str, Any]) -> None:
+def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
+    """Process one JSON-RPC 2.0 request/notification object and return the
+    response object to send back, or None if nothing should be sent
+    (notifications, and the "notifications/initialized" handshake message).
+    Shared by both transports - stdio writes the result as a line, the
+    streamable-http handler sends it as the HTTP response body."""
     msg_id = request.get("id")
     method = request.get("method")
     params = request.get("params") or {}
@@ -1082,7 +1088,7 @@ def dispatch(request: dict[str, Any]) -> None:
         if method == "initialize":
             result = handle_initialize(params)
         elif method == "notifications/initialized":
-            return
+            return None
         elif method == "ping":
             result = {}
         elif method == "tools/list":
@@ -1090,19 +1096,24 @@ def dispatch(request: dict[str, Any]) -> None:
         elif method == "tools/call":
             result = handle_tools_call(params)
         else:
-            if not is_notification:
-                send_error(msg_id, -32601, f"Method not found: {method}")
-            return
+            if is_notification:
+                return None
+            return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
     except Exception as exc:  # noqa: BLE001 - protocol-level failure
-        if not is_notification:
-            send_error(msg_id, -32603, f"Internal error: {exc}")
-        return
+        if is_notification:
+            return None
+        return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32603, "message": f"Internal error: {exc}"}}
 
-    if not is_notification:
-        send_result(msg_id, result)
+    if is_notification:
+        return None
+    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
 
-def main() -> None:
+# ---------------------------------------------------------------------------
+# Transport: stdio
+# ---------------------------------------------------------------------------
+
+def run_stdio() -> None:
     try:
         sys.stdin.reconfigure(encoding="utf-8")
         sys.stdout.reconfigure(encoding="utf-8")
@@ -1116,9 +1127,128 @@ def main() -> None:
         try:
             request = json.loads(line)
         except json.JSONDecodeError:
-            send_error(None, -32700, "Parse error: invalid JSON")
-            continue
-        dispatch(request)
+            response: dict[str, Any] | None = {
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32700, "message": "Parse error: invalid JSON"},
+            }
+        else:
+            response = handle_request(request)
+        if response is not None:
+            sys.stdout.write(json.dumps(response) + "\n")
+            sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Transport: streamable-http (stdlib http.server only - no Flask/FastAPI/
+# uvicorn). Implements the request/response half of the MCP "Streamable
+# HTTP" transport: POST a single JSON-RPC message (or a JSON array of them)
+# to the endpoint and get the JSON-RPC response(s) back in the HTTP
+# response body. This server never pushes unsolicited messages, so GET
+# (opening a server->client SSE stream) is not supported and returns 405,
+# which the spec allows for servers without that capability.
+# ---------------------------------------------------------------------------
+
+class _MCPHTTPRequestHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = f"{SERVER_NAME}/{SERVER_VERSION}"
+
+    def _send_json(self, status: int, obj: Any, extra_headers: dict[str, str] | None = None) -> None:
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_empty(self, status: int, extra_headers: dict[str, str] | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler naming convention
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error: invalid JSON"}})
+            return
+
+        if isinstance(payload, list):
+            responses = [r for r in (handle_request(item) for item in payload) if r is not None]
+            if not responses:
+                self._send_empty(202)
+                return
+            self._send_json(200, responses)
+            return
+
+        if not isinstance(payload, dict):
+            self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}})
+            return
+
+        response = handle_request(payload)
+        if response is None:
+            self._send_empty(202)
+            return
+
+        extra_headers = {"Mcp-Session-Id": self.headers.get("Mcp-Session-Id") or str(uuid.uuid4())}
+        self._send_json(200, response, extra_headers)
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._send_empty(405, {"Allow": "POST"})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._send_empty(200)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        sys.stderr.write(f"{self.address_string()} - {format % args}\n")
+
+
+def run_streamable_http(host: str, port: int) -> None:
+    server = ThreadingHTTPServer((host, port), _MCPHTTPRequestHandler)
+    print(f"{SERVER_NAME}: streamable-http transport listening on http://{host}:{port}/mcp", file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="mcp-network-tools.py",
+        description="MCP server for local network/system diagnostics, over stdio or streamable-http.",
+    )
+    parser.add_argument(
+        "--transport", choices=["stdio", "streamable-http"], default="stdio",
+        help="Transport to serve the MCP protocol over (default: stdio)",
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Host/interface to bind for --transport streamable-http (default: 127.0.0.1; use 0.0.0.0 for Docker/n8n)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8000,
+        help="Port to bind for --transport streamable-http (default: 8000)",
+    )
+    return parser.parse_args(argv)
+
+
+def main() -> None:
+    args = parse_args()
+    if args.transport == "streamable-http":
+        run_streamable_http(args.host, args.port)
+    else:
+        run_stdio()
 
 
 if __name__ == "__main__":
