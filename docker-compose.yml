@@ -4,22 +4,19 @@ services:
     container_name: mcp-network-tools
     restart: unless-stopped
 
-    # REQUIRED, not optional: this tool reports on the network of the
-    # machine it runs in. Without host networking it would only ever see
-    # this container's own isolated virtual interface/ARP/route table, not
-    # your real LAN - every tool would still "work" but return meaningless
-    # data. Host networking only works on a LINUX Docker host; see the
-    # "Docker" section of README.md before deploying this on Windows (Docker
-    # Desktop's Linux containers run inside a WSL2 VM whose network is not
-    # the real Windows host either way - run the script natively there
-    # instead of in Docker).
     network_mode: host
+
+    ports:
+      - "3337:8000"
 
     environment:
       - TZ=Europe/Amsterdam
 
     volumes:
       - mcp-network-tools_data:/app
+
+    cap_add:
+      - NET_RAW
 
     command: >
       sh -c "
@@ -30,8 +27,7 @@ services:
         if [ ! -d /app/.git ]; then
           git clone https://github.com/DomoticX/mcp-network-tools.git /app;
         else
-          cd /app &&
-          git pull;
+          cd /app && git pull;
         fi &&
 
         cd /app &&
