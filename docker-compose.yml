@@ -4,8 +4,6 @@ services:
     container_name: mcp-network-tools
     restart: unless-stopped
 
-    network_mode: host
-
     ports:
       - "3337:8000"
 
